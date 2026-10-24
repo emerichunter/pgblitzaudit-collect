@@ -1,0 +1,14 @@
+# Collector output
+zk_audit_*/
+sys_*/
+*.zip
+reports/
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: ShellCheck
+        run: |
+          mapfile -t scripts < <(find . -type f -name '*.sh' -not -path './.git/*' | sort)
+          current=()
+          legacy=()
+          for script in "${scripts[@]}"; do
+            if [[ "$script" == "./sys_collect.sh" ]]; then
+              legacy+=("$script")
+            else
+              current+=("$script")
+            fi
+          done
+          if (( ${#current[@]} > 0 )); then
+            shellcheck "${current[@]}"
+          fi
+          if (( ${#legacy[@]} > 0 )); then
+            shellcheck -e SC2029,SC2034 "${legacy[@]}"
+          fi
+
+      - name: PowerShell syntax parse
+        run: |
+          pwsh -NoProfile -Command '
+          $failed = $false
+          Get-ChildItem -Path . -Recurse -Filter *.ps1 -File | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $failed = $true
+              Write-Host "FAIL  $($_.FullName)"
+              $errors | ForEach-Object {
+                Write-Host "      $($_.Message) at $($_.Extent.StartLineNumber):$($_.Extent.StartColumnNumber)"
+              }
+            } else {
+              Write-Host "PASS  $($_.FullName)"
+            }
+          }
+          if ($failed) { exit 1 }
+          '
+
+  collect-smoke:
+    name: collect-smoke (PostgreSQL ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: [12, 15, 17]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL 17 client tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "${VERSION_CODENAME}")-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+
+      - name: Run collector smoke test
+        env:
+          PBA_TEST_DSN: postgresql://postgres:postgres@localhost:5432/postgres
+        run: bash tests/test_collect.sh
