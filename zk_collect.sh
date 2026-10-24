@@ -26,7 +26,9 @@
 #
 # =============================================================================
 #
-#  Mirrors zk_collect.ps1 — same output format, same bundle structure.
+#  Bash collector v2.0: multi-database, per-database bundle files.
+#  The Windows collector (zk_collect.ps1) is still v1.0: one database per run,
+#  snapshot-style file names. Both bundle shapes are replayable by the engine.
 #
 #  Usage:
 #    ./zk_collect.sh [OPTIONS]
