@@ -27,8 +27,8 @@
 # =============================================================================
 #
 #  Bash collector v2.0: multi-database, per-database bundle files.
-#  The Windows collector (zk_collect.ps1) is still v1.0: one database per run,
-#  snapshot-style file names. Both bundle shapes are replayable by the engine.
+#  The PowerShell collector (zk_collect.ps1) is v2.0 too and produces the same
+#  bundle layout and manifest, so either one can be replayed by the engine.
 #
 #  Usage:
 #    ./zk_collect.sh [OPTIONS]
@@ -130,15 +130,19 @@ _psql() {
     leaf="$(basename "$sql_file")-$$"
     local tmp_in="/tmp/zk_in_${leaf}"
     local tmp_out="/tmp/zk_out_${leaf}"
+    local rc=0
 
     docker cp "$sql_file" "${DOCKER_CONTAINER}:${tmp_in}" > /dev/null
     docker exec "$DOCKER_CONTAINER" \
-      sh -c "psql -U \"$PG_USER\" -d \"$db\" -A -t -q -f \"$tmp_in\" > \"$tmp_out\" 2>&1"
+      sh -c "psql -U \"$PG_USER\" -d \"$db\" -A -t -q -f \"$tmp_in\" > \"$tmp_out\" 2>&1" || rc=$?
     docker cp "${DOCKER_CONTAINER}:${tmp_out}" "$out_file" > /dev/null
     docker exec "$DOCKER_CONTAINER" rm -f "$tmp_in" "$tmp_out" > /dev/null
+    return $rc
   else
+    local rc=0
     psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$db" \
-         -A -t -q -f "$sql_file" -o "$out_file" 2>&1 | head -20 || true
+         -A -t -q -f "$sql_file" -o "$out_file" 2>&1 | head -20 || rc=$?
+    return $rc
   fi
 }
 
@@ -169,13 +173,17 @@ _pgdump() {
     local tmp_out="/tmp/zk_pgdump_${leaf}"
     local arg_str
     arg_str="$(printf ' %q' "${extra_args[@]}")"
+    local rc=0
     docker exec "$DOCKER_CONTAINER" \
-      sh -c "pg_dump -U \"$PG_USER\" -d \"$db\" ${arg_str} > \"$tmp_out\" 2>&1"
+      sh -c "pg_dump -U \"$PG_USER\" -d \"$db\" ${arg_str} > \"$tmp_out\" 2>&1" || rc=$?
     docker cp "${DOCKER_CONTAINER}:${tmp_out}" "$out_file" > /dev/null
     docker exec "$DOCKER_CONTAINER" rm -f "$tmp_out" > /dev/null
+    return $rc
   else
+    local rc=0
     pg_dump -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$db" \
-            "${extra_args[@]}" -f "$out_file" 2>&1 | head -20 || true
+            "${extra_args[@]}" -f "$out_file" 2>&1 | head -20 || rc=$?
+    return $rc
   fi
 }
 

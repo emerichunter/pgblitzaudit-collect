@@ -35,7 +35,7 @@ $env:PGPASSWORD = "..."
 .\zk_collect.ps1 -PgHost db.example.com -User audit_reader
 ```
 
-The Windows collector snapshots one database at a time (`-Database`, default `postgres`). Use `-OutputDir` to choose the destination and `-NoSchemaDump` or `-NoStatDump` to skip those steps.
+The PowerShell collector behaves like the bash one: it collects **every connectable database** by default. Use `-Database appdb` for one database, `-Databases "app,reporting"` for a specific list, `-OutputDir` to choose the destination, and `-NoSchemaDump` / `-NoStatDump` to skip those steps.
 
 ## Docker
 
@@ -64,7 +64,7 @@ The role also needs `CONNECT` on each database it should inspect. Membership in 
 
 ## What you get
 
-The bash collector creates a bundle per run:
+Both collectors create a bundle per run:
 
 ```text
 zk_audit_PG17_20261024_143000/
@@ -99,7 +99,7 @@ Expect roughly 250-400 KB per database, or about 700 KB-1.2 MB for three databas
 }
 ```
 
-The Windows collector uses `catalog_snapshot.json`, `stat_snapshot.json`, `schema_dump.sql`, and `statistics_dump.sql` for its single database. Its manifest carries the same version and file inventory fields, with `database` in place of `databases` and no `pg_major` field.
+Both collectors produce this same layout and the same manifest fields. The only difference is the `host` value: `docker:<container>` when run with the Docker option, `host:port` otherwise.
 
 ## What to do with the bundle
 
@@ -113,7 +113,7 @@ Report generation happens off-site and needs no further access to the server.
 
 ## Version compatibility
 
-PostgreSQL 12 through 18 are supported. The bash bundle name embeds the detected major version, for example `zk_audit_PG17_20261024_143000`, and `manifest.json` records the full server version. The Windows collector uses a `zk_audit_YYYYMMDD_HHMMSS` directory name and records the version in `manifest.json`.
+PostgreSQL 12 through 18 are supported. Both collectors name the bundle with the detected major version, for example `zk_audit_PG17_20261024_143000`, and `manifest.json` records the full server version.
 
 ## Troubleshooting
 

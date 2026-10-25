@@ -1,63 +1,70 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  pgBlitzAudit Collect - Zero Knowledge PostgreSQL snapshot bundle
+  pgBlitzAudit Collect v2.0 - Zero Knowledge PostgreSQL snapshot bundle (multi-database)
 
 .DESCRIPTION
-  Collects a complete schema + statistics snapshot from a PostgreSQL instance
-  without extracting any user data.
+  Collects schema and statistics metadata from every connectable database in a
+  PostgreSQL cluster without extracting any user data.
 
-  Outputs a timestamped directory containing:
-    catalog_snapshot.json   - schema, indexes, roles, settings (zk_catalog_dump.sql)
-    stat_snapshot.json      - query stats, table stats, bloat, locks (zk_stat_dump.sql)
-    schema_dump.sql         - DDL structure (pg_dump --schema-only)
-    statistics_dump.sql     - planner statistics (pg_dump --statistics-only, PG18+)
-    manifest.json           - collection metadata + file inventory
+  Outputs one timestamped directory containing, per database:
+    catalog_db_<db>.json       - schema, indexes, roles, settings (zk_catalog_dump.sql)
+    stat_db_<db>.json          - query stats, table stats, bloat, locks (zk_stat_dump.sql)
+    schema_dump_<db>.sql       - DDL structure (pg_dump --schema-only)
+    statistics_dump_<db>.sql   - planner statistics (pg_dump --statistics-only, PG18+)
+  plus a manifest.json describing the run.
 
-.PARAMETER Host
+  Bundle layout and manifest are identical to the bash collector (zk_collect.sh v2.0),
+  so the same replayer handles both.
+
+.PARAMETER PgHost
   PostgreSQL server hostname (default: localhost)
 .PARAMETER Port
   PostgreSQL port (default: 5432)
 .PARAMETER Database
-  Database to snapshot (default: postgres)
+  Collect a single database (default: every connectable database)
+.PARAMETER Databases
+  Comma-separated list of databases to collect (ignored when -Database is set)
 .PARAMETER User
   PostgreSQL user (default: postgres)
-.PARAMETER OutputDir
-  Output directory path (default: auto-named zk_audit_YYYYMMDD_HHMMSS)
-.PARAMETER DockerContainer
-  If set, run psql/pg_dump inside this Docker container (name or ID)
 .PARAMETER Password
   PostgreSQL password (or set PGPASSWORD env var)
+.PARAMETER OutputDir
+  Output directory (default: zk_audit_PG<major>_yyyyMMdd_HHmmss)
+.PARAMETER DockerContainer
+  Run psql/pg_dump inside this Docker container (name or ID)
 .PARAMETER NoSchemaDump
-  Skip pg_dump --schema-only (useful if you only want live stats)
+  Skip pg_dump --schema-only
 .PARAMETER NoStatDump
-  Skip pg_dump --statistics-only
-.PARAMETER Databases
-  Comma-separated list of databases for pg_dump (default: same as -Database)
+  Skip pg_dump --statistics-only (PG18+)
 
 .EXAMPLE
-  # Local PostgreSQL
-  .\zk_collect.ps1 -Host localhost -Port 5432 -Database mydb -User postgres
+  # Whole cluster, local PostgreSQL
+  .\zk_collect.ps1 -PgHost localhost -User postgres
 
 .EXAMPLE
-  # Docker container
-  .\zk_collect.ps1 -DockerContainer pg-test-report -Database postgres -User postgres
+  # Whole cluster inside a Docker container
+  .\zk_collect.ps1 -DockerContainer my-postgres -User postgres
 
 .EXAMPLE
-  # With password, custom output directory
-  .\zk_collect.ps1 -Host db.example.com -User readonly -Password secret -OutputDir ./my_audit
+  # One database only
+  .\zk_collect.ps1 -PgHost db.example.com -User readonly -Database mydb -Password secret
+
+.EXAMPLE
+  # Two specific databases, custom output directory
+  .\zk_collect.ps1 -PgHost db.example.com -User readonly -Databases "app,reporting" -OutputDir .\my_audit
 #>
 
 [CmdletBinding()]
 param(
     [string]$PgHost    = "localhost",
     [int]   $Port      = 5432,
-    [string]$Database  = "postgres",
+    [string]$Database  = "",
+    [string]$Databases = "",
     [string]$User      = "postgres",
     [string]$Password  = "",
     [string]$OutputDir = "",
     [string]$DockerContainer = "",
-    [string]$Databases = "",
     [switch]$NoSchemaDump,
     [switch]$NoStatDump
 )
@@ -69,247 +76,312 @@ $ErrorActionPreference = "Stop"
 # Helpers
 # ---------------------------------------------------------------------------
 
-function Write-Step([string]$msg) {
-    Write-Host "  $msg" -ForegroundColor Cyan
+function Write-Step([string]$msg) { Write-Host "  $msg" -ForegroundColor Cyan }
+function Write-Ok([string]$msg)   { Write-Host "  OK  $msg" -ForegroundColor Green }
+function Write-Warn([string]$msg) { Write-Host "  WARN  $msg" -ForegroundColor Yellow }
+function Write-Err([string]$msg)  { Write-Host "  ERR  $msg" -ForegroundColor Red }
+function Write-Gray([string]$msg) { Write-Host "  $msg" -ForegroundColor DarkGray }
+
+function Get-SizeKb([string]$path) {
+    if (Test-Path -LiteralPath $path) {
+        return [int][math]::Round(((Get-Item -LiteralPath $path).Length + 512) / 1024, 0)
+    }
+    return 0
 }
-function Write-Ok([string]$msg) {
-    Write-Host "  OK  $msg" -ForegroundColor Green
+
+function ConvertTo-JsonText([string]$s) {
+    if ($null -eq $s) { return "" }
+    $s = $s.Replace('\', '\\')
+    $s = $s.Replace('"', '\"')
+    $s = $s.Replace("`r", '\r')
+    $s = $s.Replace("`n", '\n')
+    $s = $s.Replace("`t", '\t')
+    return $s
 }
-function Write-Warn([string]$msg) {
-    Write-Host "  WARN  $msg" -ForegroundColor Yellow
+
+function Write-Utf8NoBom([string]$path, [string]$text) {
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($path, $text, $enc)
 }
-function Write-Err([string]$msg) {
-    Write-Host "  ERR  $msg" -ForegroundColor Red
+
+# Inline SQL -> stdout (string)
+function Invoke-PsqlText {
+    param([string]$Sql, [string]$Db = "postgres")
+
+    $raw = $null
+    if ($DockerContainer) {
+        $raw = & docker exec $DockerContainer psql -U $User -d $Db -A -t -q -c $Sql 2>$null
+    } else {
+        $raw = & psql -h $PgHost -p $Port -U $User -d $Db -A -t -q -c $Sql 2>$null
+    }
+    if ($null -eq $raw) { return "" }
+    $text = ($raw -join "`n")
+    return $text.Replace("`r", "").Trim()
+}
+
+# SQL file -> output file
+function Invoke-PsqlFile {
+    param([string]$SqlFile, [string]$OutFile, [string]$Db)
+
+    $absScript = (Resolve-Path -LiteralPath $SqlFile).Path
+
+    if ($DockerContainer) {
+        $leaf   = "$PID-" + (Split-Path -Leaf $SqlFile)
+        $tmpIn  = "/tmp/zk_in_$leaf"
+        $tmpOut = "/tmp/zk_out_$PID-" + (Split-Path -Leaf $OutFile)
+
+        & docker cp $absScript "${DockerContainer}:$tmpIn" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "docker cp of $SqlFile failed (exit $LASTEXITCODE)" }
+
+        & docker exec $DockerContainer sh -c "psql -U `"$User`" -d `"$Db`" -A -t -q -f `"$tmpIn`" > `"$tmpOut`" 2>&1"
+        $rc = $LASTEXITCODE
+
+        & docker cp "${DockerContainer}:$tmpOut" $OutFile | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "docker cp of the result failed (exit $LASTEXITCODE)" }
+        & docker exec $DockerContainer rm -f $tmpIn $tmpOut | Out-Null
+
+        if ($rc -ne 0) { throw "psql exited with code $rc" }
+    } else {
+        & psql -h $PgHost -p $Port -U $User -d $Db -A -t -q -f $absScript -o $OutFile 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "psql exited with code $LASTEXITCODE" }
+    }
+
+    if (-not (Test-Path -LiteralPath $OutFile)) { throw "no output produced: $OutFile" }
+}
+
+# pg_dump -> output file
+function Invoke-PgDump {
+    param([string]$OutFile, [string]$Db, [string[]]$ExtraArgs)
+
+    if ($null -eq $ExtraArgs) { $ExtraArgs = @() }
+
+    if ($DockerContainer) {
+        $tmpOut = "/tmp/zk_pgdump_$PID-" + (Split-Path -Leaf $OutFile)
+        $argStr = ($ExtraArgs -join " ")
+        & docker exec $DockerContainer sh -c "pg_dump -U `"$User`" -d `"$Db`" $argStr > `"$tmpOut`" 2>&1"
+        $rc = $LASTEXITCODE
+        & docker cp "${DockerContainer}:$tmpOut" $OutFile | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "docker cp of the dump failed (exit $LASTEXITCODE)" }
+        & docker exec $DockerContainer rm -f $tmpOut | Out-Null
+        if ($rc -ne 0) { throw "pg_dump exited with code $rc" }
+    } else {
+        $connArgs = @("-h", $PgHost, "-p", $Port.ToString(), "-U", $User, "-d", $Db)
+        & pg_dump @connArgs @ExtraArgs -f $OutFile 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "pg_dump exited with code $LASTEXITCODE" }
+    }
+
+    if (-not (Test-Path -LiteralPath $OutFile)) { throw "no dump produced: $OutFile" }
+    if ((Get-Item -LiteralPath $OutFile).Length -eq 0) { throw "dump is empty: $OutFile" }
 }
 
 # ---------------------------------------------------------------------------
-# Setup output directory
-# ---------------------------------------------------------------------------
-
-if (-not $OutputDir) {
-    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $OutputDir = "zk_audit_$timestamp"
-}
-New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
-$OutputDir = Resolve-Path $OutputDir
-
-Write-Host ""
-Write-Host "  pgBlitzAudit Collect v1.0" -ForegroundColor White
-Write-Host "  Output: $OutputDir" -ForegroundColor DarkGray
-Write-Host ""
-
-# ---------------------------------------------------------------------------
-# Password / env setup
+# Password / environment
 # ---------------------------------------------------------------------------
 
 $origPgPassword = $env:PGPASSWORD
 if ($Password) { $env:PGPASSWORD = $Password }
 
-# ---------------------------------------------------------------------------
-# Build psql / pg_dump command wrappers
-# ---------------------------------------------------------------------------
-
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-function Invoke-Psql {
-    param([string]$SqlFile, [string]$OutFile, [string]$Db = $Database)
-
-    $absScript = Resolve-Path $SqlFile
-
-    if ($DockerContainer) {
-        # Copy SQL file into container, run, copy result back
-        $tmpIn  = "/tmp/zk_in_$(Split-Path -Leaf $SqlFile)"
-        $tmpOut = "/tmp/zk_out_$(Split-Path -Leaf $OutFile)"
-
-        docker cp $absScript "${DockerContainer}:$tmpIn" | Out-Null
-        $rc = docker exec $DockerContainer `
-            sh -c "psql -U $User -d $Db -A -t -q -f $tmpIn > $tmpOut 2>&1"
-        docker cp "${DockerContainer}:$tmpOut" $OutFile | Out-Null
-        docker exec $DockerContainer rm -f $tmpIn $tmpOut | Out-Null
-    } else {
-        $connStr = "-h $PgHost -p $Port -U $User -d $Db"
-        & psql $connStr.Split() -A -t -q -f $absScript -o $OutFile 2>&1 | Out-Null
-    }
-}
-
-function Invoke-PgDump {
-    param([string[]]$ExtraArgs, [string]$OutFile, [string]$Db = $Database)
-
-    if ($DockerContainer) {
-        $tmpOut = "/tmp/zk_pgdump_$(Split-Path -Leaf $OutFile)"
-        $argStr = ($ExtraArgs -join " ")
-        docker exec $DockerContainer `
-            sh -c "pg_dump -U $User -d $Db $argStr > $tmpOut 2>&1"
-        docker cp "${DockerContainer}:$tmpOut" $OutFile | Out-Null
-        docker exec $DockerContainer rm -f $tmpOut | Out-Null
-    } else {
-        $connArgs = @("-h", $PgHost, "-p", $Port.ToString(), "-U", $User, "-d", $Db)
-        & pg_dump @connArgs @ExtraArgs -f $OutFile 2>&1 | Out-Null
-    }
-}
-
 # ---------------------------------------------------------------------------
-# Step 1: catalog_snapshot.json
+# Step 0: detect PostgreSQL major version (before naming the output directory)
 # ---------------------------------------------------------------------------
 
-Write-Step "Collecting catalog snapshot (schema, indexes, roles, settings)..."
-$catalogSql = Join-Path $scriptDir "zk_catalog_dump.sql"
-$catalogOut = Join-Path $OutputDir "catalog_snapshot.json"
-
-try {
-    Invoke-Psql -SqlFile $catalogSql -OutFile $catalogOut
-    $size = (Get-Item $catalogOut).Length
-    Write-Ok "catalog_snapshot.json  ($([math]::Round($size/1KB, 1)) KB)"
-} catch {
-    Write-Warn "catalog_snapshot.json failed: $_"
-}
-
-# ---------------------------------------------------------------------------
-# Step 2: stat_snapshot.json
-# ---------------------------------------------------------------------------
-
-Write-Step "Collecting statistics snapshot (pg_stat_statements, bloat, locks)..."
-$statSql = Join-Path $scriptDir "zk_stat_dump.sql"
-$statOut  = Join-Path $OutputDir "stat_snapshot.json"
-
-try {
-    Invoke-Psql -SqlFile $statSql -OutFile $statOut
-    $size = (Get-Item $statOut).Length
-    Write-Ok "stat_snapshot.json  ($([math]::Round($size/1KB, 1)) KB)"
-} catch {
-    Write-Warn "stat_snapshot.json failed: $_"
-}
-
-# ---------------------------------------------------------------------------
-# Detect PostgreSQL major version (needed for pg_dump option selection)
-# ---------------------------------------------------------------------------
+$connectDb = if ($Database) { $Database } else { "postgres" }
 
 $pgVerNum = 0
 try {
-    if ($DockerContainer) {
-        $pgVerNum = [int](docker exec $DockerContainer psql -U $User -d $Database -A -t -q `
-            -c "SELECT current_setting('server_version_num')::int;" 2>$null)
-    } else {
-        $pgVerNum = [int](& psql -h $PgHost -p $Port -U $User -d $Database -A -t -q `
-            -c "SELECT current_setting('server_version_num')::int;" 2>$null)
-    }
+    $verText = Invoke-PsqlText -Sql "SELECT current_setting('server_version_num')::int;" -Db $connectDb
+    if ($verText) { $pgVerNum = [int]$verText }
 } catch { $pgVerNum = 0 }
 
-$pgMajor = [math]::Floor($pgVerNum / 10000)
-Write-Host "  Detected PostgreSQL major version: $pgMajor" -ForegroundColor DarkGray
+$pgMajor = [int][math]::Floor($pgVerNum / 10000)
 
 # ---------------------------------------------------------------------------
-# Step 3: pg_dump --schema-only
-# NOTE: --schema-only excludes sequence current values.
-#       Sequence data is captured via zk_catalog_dump.sql (pg_sequences view).
-#       For PG17+, --no-statistics keeps schema dump lean (stats go in step 4).
+# Output directory
+# ---------------------------------------------------------------------------
+
+if (-not $OutputDir) {
+    $OutputDir = "zk_audit_PG$($pgMajor)_" + (Get-Date -Format "yyyyMMdd_HHmmss")
+}
+New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+$OutputDir = (Resolve-Path -LiteralPath $OutputDir).Path
+
+Write-Host ""
+Write-Host "  pgBlitzAudit Collect v2.0 (PowerShell)" -ForegroundColor White
+Write-Gray "Output: $OutputDir"
+Write-Gray "PostgreSQL major version: $pgMajor"
+Write-Host ""
+
+$catalogSql = Join-Path $scriptDir "zk_catalog_dump.sql"
+$statSql    = Join-Path $scriptDir "zk_stat_dump.sql"
+if (-not (Test-Path -LiteralPath $catalogSql)) { Write-Warn "zk_catalog_dump.sql not found at: $catalogSql" }
+if (-not (Test-Path -LiteralPath $statSql))    { Write-Warn "zk_stat_dump.sql not found at: $statSql" }
+
+# ---------------------------------------------------------------------------
+# Step 1: discover databases
+# ---------------------------------------------------------------------------
+
+$dbList = @()
+
+if ($Database) {
+    $dbList = @($Database)
+    Write-Gray "Single-database mode: $Database"
+} elseif ($Databases) {
+    $dbList = @($Databases.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+    Write-Gray "Selected databases: $($dbList -join ' ')"
+} else {
+    Write-Step "Discovering databases..."
+    $discoverySql = "SELECT datname FROM pg_database " +
+                    "WHERE datallowconn AND datname NOT IN ('template0','template1') " +
+                    "ORDER BY datname;"
+    $raw = Invoke-PsqlText -Sql $discoverySql -Db $connectDb
+    if ($raw) {
+        $dbList = @($raw.Split("`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+    }
+    if ($dbList.Count -eq 0) {
+        Write-Warn "No connectable databases found. Falling back to 'postgres'."
+        $dbList = @("postgres")
+    }
+    Write-Ok "Found $($dbList.Count) database(s): $($dbList -join ' ')"
+}
+
+# ---------------------------------------------------------------------------
+# Step 2: catalog + statistics per database
+# ---------------------------------------------------------------------------
+
+foreach ($db in $dbList) {
+    Write-Host ""
+    Write-Step "--- Database: $db ---"
+
+    if (Test-Path -LiteralPath $catalogSql) {
+        $out = Join-Path $OutputDir "catalog_db_$db.json"
+        Write-Step "  Collecting catalog snapshot..."
+        try {
+            Invoke-PsqlFile -SqlFile $catalogSql -OutFile $out -Db $db
+            Write-Ok "catalog_db_$db.json  ($(Get-SizeKb $out) KB)"
+        } catch {
+            Write-Warn "catalog_db_$db.json failed: $_"
+        }
+    }
+
+    if (Test-Path -LiteralPath $statSql) {
+        $out = Join-Path $OutputDir "stat_db_$db.json"
+        Write-Step "  Collecting statistics snapshot..."
+        try {
+            Invoke-PsqlFile -SqlFile $statSql -OutFile $out -Db $db
+            Write-Ok "stat_db_$db.json  ($(Get-SizeKb $out) KB)"
+        } catch {
+            Write-Warn "stat_db_$db.json failed: $_"
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Step 3: pg_dump --schema-only per database
 # ---------------------------------------------------------------------------
 
 if (-not $NoSchemaDump) {
-    Write-Step "Running pg_dump --schema-only..."
-    $schemaOut = Join-Path $OutputDir "schema_dump.sql"
-
-    $schemaArgs = @("--schema-only", "--no-password")
-    # PG18+ supports --no-statistics to keep schema dump lean (stats go in statistics_dump.sql)
-    if ($pgMajor -ge 18) { $schemaArgs += "--no-statistics" }
-
-    try {
-        Invoke-PgDump -ExtraArgs $schemaArgs -OutFile $schemaOut
-        $size = (Get-Item $schemaOut).Length
-        Write-Ok "schema_dump.sql  ($([math]::Round($size/1KB, 1)) KB)"
-    } catch {
-        Write-Warn "schema_dump.sql failed: $_"
+    Write-Host ""
+    foreach ($db in $dbList) {
+        Write-Step "pg_dump --schema-only: $db..."
+        $out = Join-Path $OutputDir "schema_dump_$db.sql"
+        $schemaArgs = @("--schema-only", "--no-password")
+        if ($pgMajor -ge 18) { $schemaArgs += "--no-statistics" }
+        try {
+            Invoke-PgDump -OutFile $out -Db $db -ExtraArgs $schemaArgs
+            Write-Ok "schema_dump_$db.sql  ($(Get-SizeKb $out) KB)"
+        } catch {
+            Write-Warn "schema_dump_$db.sql failed: $_"
+        }
     }
 }
 
 # ---------------------------------------------------------------------------
-# Step 4: pg_dump --statistics-only  (PostgreSQL 18+ only)
-# PG17 and earlier: planner statistics are captured via pg_stats in
-#   catalog_snapshot.json (planner_stats section). No pg_dump equivalent.
-# PG18+: --statistics-only dumps ANALYZE statistics objects separately.
-# Note on --sequence-data: excluded by design - sequence current values are
-#   captured via pg_sequences in catalog_snapshot.json instead.
+# Step 4: pg_dump --statistics-only (PG18+ only)
 # ---------------------------------------------------------------------------
 
 if (-not $NoStatDump) {
-    $statsOut = Join-Path $OutputDir "statistics_dump.sql"
-
-    if ($pgMajor -ge 18) {
-        Write-Step "Running pg_dump --statistics-only (PG18+)..."
-        try {
-            Invoke-PgDump -ExtraArgs @("--statistics-only", "--no-password") -OutFile $statsOut
-            $size = (Get-Item $statsOut).Length
-            Write-Ok "statistics_dump.sql  ($([math]::Round($size/1KB, 1)) KB)"
-        } catch {
-            Write-Warn "statistics_dump.sql failed: $_"
-            "-- pg_dump --statistics-only failed" | Out-File $statsOut -Encoding utf8
+    Write-Host ""
+    foreach ($db in $dbList) {
+        $out = Join-Path $OutputDir "statistics_dump_$db.sql"
+        if ($pgMajor -ge 18) {
+            Write-Step "pg_dump --statistics-only (PG18+): $db..."
+            try {
+                Invoke-PgDump -OutFile $out -Db $db -ExtraArgs @("--statistics-only", "--no-password")
+                Write-Ok "statistics_dump_$db.sql  ($(Get-SizeKb $out) KB)"
+            } catch {
+                Write-Warn "statistics_dump_$db.sql failed: $_"
+                Write-Utf8NoBom $out "-- pg_dump --statistics-only failed for database: $db`n"
+            }
+        } else {
+            Write-Gray "Skipping pg_dump --statistics-only for $db (PG$pgMajor - requires PG18+)"
+            $note = "-- pg_dump --statistics-only requires PostgreSQL 18+.`n" +
+                    "-- Planner statistics are available in catalog_db_$db.json (planner_stats section).`n" +
+                    "-- PostgreSQL major version detected: $pgMajor`n"
+            Write-Utf8NoBom $out $note
         }
-    } else {
-        Write-Step "Skipping pg_dump --statistics-only (PG$pgMajor - requires PG18+)..."
-        Write-Host "    Planner stats captured via pg_stats in catalog_snapshot.json" -ForegroundColor DarkGray
-        $noteLines = @(
-            "-- pg_dump --statistics-only requires PostgreSQL 18+.",
-            "-- Planner statistics are available in catalog_snapshot.json (planner_stats section).",
-            "-- PostgreSQL major version detected: $pgMajor"
-        )
-        $noteLines | Out-File $statsOut -Encoding utf8
-        Write-Ok "statistics_dump.sql  (note written)"
     }
 }
 
 # ---------------------------------------------------------------------------
-# Step 5: manifest.json
+# Step 5: manifest.json (built by hand so arrays never collapse on PS 5.1)
 # ---------------------------------------------------------------------------
 
+Write-Host ""
 Write-Step "Writing manifest..."
 
 $pgVersion = ""
-try {
-    if ($DockerContainer) {
-        $pgVersion = docker exec $DockerContainer psql -U $User -d $Database -A -t -q `
-            -c "SELECT version();" 2>$null
-    } else {
-        $pgVersion = & psql -h $PgHost -p $Port -U $User -d $Database -A -t -q `
-            -c "SELECT version();" 2>$null
-    }
-    $pgVersion = $pgVersion.Trim()
-} catch {}
+try { $pgVersion = Invoke-PsqlText -Sql "SELECT version();" -Db $connectDb } catch { $pgVersion = "" }
 
-$files = Get-ChildItem $OutputDir -File | ForEach-Object {
-    [ordered]@{
-        name       = $_.Name
-        size_bytes = $_.Length
-        modified   = $_.LastWriteTimeUtc.ToString("o")
-    }
+$hostVal = if ($DockerContainer) { "docker:$DockerContainer" } else { "${PgHost}:$Port" }
+$generatedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+$dbJson = (@($dbList | ForEach-Object { '"' + (ConvertTo-JsonText $_) + '"' })) -join ","
+
+$filesJson = @()
+$allFiles = @(Get-ChildItem -LiteralPath $OutputDir -File)
+$ordered = @($allFiles | Where-Object { $_.Extension -eq ".json" -and $_.Name -ne "manifest.json" } | Sort-Object Name) +
+           @($allFiles | Where-Object { $_.Extension -eq ".sql" } | Sort-Object Name)
+
+foreach ($f in $ordered) {
+    $modified = $f.LastWriteTimeUtc.ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $filesJson += '{"name":"' + (ConvertTo-JsonText $f.Name) + '","size_bytes":' + $f.Length +
+                  ',"modified":"' + $modified + '"}'
 }
 
-$manifest = [ordered]@{
-    zk_audit_version = "1.0"
-    generated_at     = (Get-Date -Format "o")
-    pg_version       = $pgVersion
-    database         = $Database
-    host             = if ($DockerContainer) { "docker:$DockerContainer" } else { "${PgHost}:$Port" }
-    files            = $files
+$manifest = @"
+{
+  "zk_audit_version": "2.0",
+  "generated_at": "$generatedAt",
+  "pg_version": "$(ConvertTo-JsonText $pgVersion)",
+  "pg_major": $pgMajor,
+  "host": "$(ConvertTo-JsonText $hostVal)",
+  "databases": [$dbJson],
+  "files": [$(($filesJson -join ","))]
 }
+"@
 
-$manifest | ConvertTo-Json -Depth 5 | Out-File (Join-Path $OutputDir "manifest.json") -Encoding utf8
+Write-Utf8NoBom (Join-Path $OutputDir "manifest.json") $manifest
 Write-Ok "manifest.json"
 
 # ---------------------------------------------------------------------------
-# Done
+# Restore PGPASSWORD
 # ---------------------------------------------------------------------------
 
-if ($Password -or $origPgPassword) {
-    $env:PGPASSWORD = if ($origPgPassword) { $origPgPassword } else { "" }
+if ($Password) {
+    if ($origPgPassword) { $env:PGPASSWORD = $origPgPassword } else { Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue }
 }
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
 
 Write-Host ""
 Write-Host "  Bundle ready: $OutputDir" -ForegroundColor White
+Write-Gray "Databases collected: $($dbList -join ' ')"
 Write-Host ""
-
-# Print file summary
-Get-ChildItem $OutputDir -File | ForEach-Object {
-    $kb = [math]::Round($_.Length / 1KB, 1)
-    Write-Host ("    {0,-32} {1,8} KB" -f $_.Name, $kb) -ForegroundColor DarkGray
+foreach ($f in @(Get-ChildItem -LiteralPath $OutputDir -File | Sort-Object Name)) {
+    Write-Host ("  {0,-44} {1,8} KB" -f $f.Name, [int][math]::Round(($f.Length + 512) / 1024, 0)) -ForegroundColor DarkGray
 }
 Write-Host ""
