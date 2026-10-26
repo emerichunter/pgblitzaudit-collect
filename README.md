@@ -115,6 +115,22 @@ Report generation happens off-site and needs no further access to the server.
 
 PostgreSQL 12 through 18 are supported. Both collectors name the bundle with the detected major version, for example `zk_audit_PG17_20261024_143000`, and `manifest.json` records the full server version.
 
+## Verify a bundle
+
+`tests/battle-test.ps1` checks a bundle for the failure modes that a "it ran
+fine" test misses — unparseable JSON, a byte-order mark, SQL error text written
+where a snapshot should be, files listed in the manifest that are missing or the
+wrong size, truncated per-database snapshots, and leaked password hashes:
+
+```powershell
+.\tests\battle-test.ps1 -Bundle .\zk_audit_PG17_20261024_143000
+```
+
+It also verifies the other bundle dialect (myblitzaudit), so one script covers
+both product lines. Exit code 0 means every check passed; the run writes
+`battle-test-evidence.json` into the bundle with the PowerShell version, the OS,
+the file inventory and any findings, so the result travels as evidence.
+
 ## Troubleshooting
 
 - **`pg_stat_statements` is not installed or not preloaded**: the `stat_statements` section comes back empty (`null`), not as an error. Enable it with `shared_preload_libraries = 'pg_stat_statements'`, restart PostgreSQL, then run `CREATE EXTENSION IF NOT EXISTS pg_stat_statements;` in each database you collect.
