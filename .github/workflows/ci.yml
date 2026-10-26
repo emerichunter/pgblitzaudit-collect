@@ -27,8 +27,9 @@ jobs:
         run: |
           $bad = 0
           Get-ChildItem -Recurse -Filter *.ps1 | ForEach-Object {
+            $tokens = $null
             $errors = $null
-            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors)
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors)
             if ($errors.Count -gt 0) { Write-Host "FAIL $($_.Name): $($errors[0].Message)"; $bad++ }
             else { Write-Host "OK $($_.Name)" }
           }
