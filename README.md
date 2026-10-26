@@ -19,6 +19,22 @@ It never collects table row data, query literals, password hashes, or connection
 - Optional `track_io_timing`: adds I/O wait timing to `pg_stat_statements`. Without it, timing columns are zero or unavailable.
 - `track_counts` stays at its PostgreSQL default (`on`) for table and index statistics.
 
+## Handing this to a client
+
+`make-client-kit.sh` builds a zip with only what a client needs: both
+collectors, the dump SQL, both acceptance tests, the collection guide and a
+checksum file.
+
+```bash
+./make-client-kit.sh --version 2.0
+# dist/pgblitzaudit-kit-2.0.zip  + SHA-256
+```
+
+The guide inside, [docs/collection-guide.md](docs/collection-guide.md), is
+written for the client's DBA: grants, one command per platform, verification,
+packaging, and the table of what leaves their server for their security
+reviewer.
+
 ## Quick start: Linux, macOS, WSL
 
 ```bash
