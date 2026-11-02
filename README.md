@@ -129,7 +129,24 @@ Report generation happens off-site and needs no further access to the server.
 
 ## Version compatibility
 
-PostgreSQL 12 through 18 are supported. Both collectors name the bundle with the detected major version, for example `zk_audit_PG17_20261024_143000`, and `manifest.json` records the full server version.
+PostgreSQL **10 through 18** are supported. This is measured, not assumed: a
+1 559-database fleet running 10.3 to 17.6 was collected without a single empty
+bundle after the guards below were added.
+
+The SQL adapts at run time instead of branching on documentation:
+
+- `psql` `\if` blocks cover columns that appear in later releases
+  (`attgenerated` in 12+, `prokind` in 11+, `checksum_failures` in 12+). The
+  branch that is not taken is never parsed, so the script runs on every version.
+- `pg_relation_size` is called by OID, because the regclass form is refused on
+  some 10.x builds for a role without CREATE on the schema.
+- Table spaces are filtered with `has_tablespace_privilege(oid, 'CREATE')`:
+  calling `pg_tablespace_size('pg_global')` on 10.3 raises *permission denied*
+  and emptied every file on that instance.
+
+Both collectors name the bundle with the detected major version, for example
+`zk_audit_PG17_20261024_143000`, and `manifest.json` records the full server
+version.
 
 ## Verify a bundle
 
@@ -150,6 +167,13 @@ the file inventory and any findings, so the result travels as evidence.
 ## Troubleshooting
 
 - **`pg_stat_statements` is not installed or not preloaded**: the `stat_statements` section comes back empty (`null`), not as an error. Enable it with `shared_preload_libraries = 'pg_stat_statements'`, restart PostgreSQL, then run `CREATE EXTENSION IF NOT EXISTS pg_stat_statements;` in each database you collect.
+  The two conditions are not the same and only one of them is visible in the
+  catalogue. A database can hold the extension while the library was never
+  preloaded; reading the view then fails with *pg_stat_statements must be loaded
+  via shared_preload_libraries* and, before this was fixed, `psql` wrote a
+  **zero-byte** statistics file, losing the whole section rather than one part of
+  it. The guard now requires the GUC `pg_stat_statements.max`, which exists only
+  when the module is actually loaded.
 - **Permission denied on a section**: sections the role cannot read degrade to `N/A` in the report instead of failing the run. Grant `pg_monitor` and `pg_read_all_stats` to reduce gaps.
 - **`pg_dump: server version mismatch`**: install the client tools for the server major version, or run the collector inside the database container with `--docker-container`.
 - **Nothing is collected**: verify the role can connect (`psql -h <host> -U <user> -d postgres`) and that `psql` and `pg_dump` are on `PATH`.
