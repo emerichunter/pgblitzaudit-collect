@@ -40,6 +40,14 @@
 \pset tuples_only on
 \pset pager off
 
+-- Version detection - gates PG11+ / PG12+ columns so the dump also runs on PG10.
+-- psql \if branches are resolved client-side, so the untaken branch is never
+-- parsed by the server (a runtime CASE could not hide a missing column).
+SELECT
+  (current_setting('server_version_num')::int >= 110000) AS is_pg11,
+  (current_setting('server_version_num')::int >= 120000) AS is_pg12
+\gset
+
 WITH
 
 -- ---------------------------------------------------------------------------
@@ -107,8 +115,12 @@ tablespaces AS (
   SELECT json_agg(json_build_object(
     'name',       spcname,
     'owner',      pg_get_userbyid(spcowner),
-    'location',   pg_tablespace_location(oid),
-    'size_bytes', pg_tablespace_size(oid)
+    -- pg_tablespace_size()/location() raise "permission denied for tablespace"
+    -- (PG10.3 and older) unless the role holds CREATE: guard instead of failing.
+    'location',   CASE WHEN has_tablespace_privilege(oid, 'CREATE')
+                       THEN pg_tablespace_location(oid) ELSE NULL END,
+    'size_bytes', CASE WHEN has_tablespace_privilege(oid, 'CREATE')
+                       THEN pg_tablespace_size(oid) ELSE NULL END
   ) ORDER BY spcname) AS v
   FROM pg_tablespace
 ),
@@ -121,13 +133,13 @@ tables AS (
     'table',           t.tablename,
     'owner',           t.tableowner,
     'tablespace',      t.tablespace,
-    'total_bytes',     pg_total_relation_size(t.schemaname || '.' || quote_ident(t.tablename)),
-    'table_bytes',     pg_relation_size(t.schemaname || '.' || quote_ident(t.tablename)),
-    'index_bytes',     pg_indexes_size(t.schemaname || '.' || quote_ident(t.tablename)),
+    'total_bytes',     pg_total_relation_size(c.oid),
+    'table_bytes',     pg_relation_size(c.oid),
+    'index_bytes',     pg_indexes_size(c.oid),
     'toast_bytes',     COALESCE(
-                         pg_total_relation_size(t.schemaname || '.' || quote_ident(t.tablename))
-                         - pg_relation_size(t.schemaname || '.' || quote_ident(t.tablename))
-                         - pg_indexes_size(t.schemaname || '.' || quote_ident(t.tablename)), 0),
+                         pg_total_relation_size(c.oid)
+                         - pg_relation_size(c.oid)
+                         - pg_indexes_size(c.oid), 0),
     'row_estimate',    c.reltuples::bigint,
     'relpages',        c.relpages,
     'relallvisible',   c.relallvisible,
@@ -162,7 +174,11 @@ columns AS (
     'attndims',      a.attndims,
     'atthasdef',     a.atthasdef,
     'attidentity',   a.attidentity::text,
+\if :is_pg12
     'attgenerated',  a.attgenerated::text,
+\else
+    'attgenerated',  NULL,   -- column type not exposed before PG12
+\endif
     'atttypmod',     a.atttypmod,     -- type modifier (e.g. varchar(N))
     'type_len',      CASE a.attlen
                        WHEN -1 THEN 'variable'
@@ -194,7 +210,7 @@ indexes AS (
     'index_name',   indexname,
     'tablespace',   tablespace,
     'index_def',    indexdef,
-    'size_bytes',   pg_relation_size(schemaname || '.' || quote_ident(indexname)),
+    'size_bytes',   pg_relation_size(c.oid),
     'is_unique',    ix.indisunique,
     'is_primary',   ix.indisprimary,
     'is_exclusion', ix.indisexclusion,
@@ -454,6 +470,7 @@ functions AS (
     'schema',           n.nspname,
     'name',             p.proname,
     'language',         l.lanname,
+\if :is_pg11
     'kind',             CASE p.prokind
                           WHEN 'f' THEN 'function'
                           WHEN 'p' THEN 'procedure'
@@ -462,6 +479,14 @@ functions AS (
                           ELSE p.prokind::text END,
     'return_type',      CASE WHEN p.prokind = 'p' THEN NULL
                              ELSE pg_get_function_result(p.oid) END,
+\else
+    -- PG10: pg_proc.prokind does not exist yet (added in PG11).
+    -- proisagg / proiswindow are the pre-PG11 equivalents; no procedures exist.
+    'kind',             CASE WHEN p.proisagg    THEN 'aggregate'
+                             WHEN p.proiswindow THEN 'window'
+                             ELSE 'function' END,
+    'return_type',      pg_get_function_result(p.oid),
+\endif
     'arguments',        pg_get_function_arguments(p.oid),
     'volatility',       CASE p.provolatile
                           WHEN 'i' THEN 'immutable'

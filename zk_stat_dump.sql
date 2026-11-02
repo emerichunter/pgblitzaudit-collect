@@ -56,7 +56,13 @@ SELECT
   (current_setting('server_version_num')::int >= 150000) AS is_pg15,
   (current_setting('server_version_num')::int >= 140000) AS is_pg14,
   (current_setting('server_version_num')::int >= 130000) AS is_pg13,
-  EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements') AS has_pss
+  (current_setting('server_version_num')::int >= 120000) AS is_pg12,
+  -- Must test the RELATION, not just the pg_extension row: a restored/partially
+  -- dropped database can register the extension while its objects are missing
+  -- (observed: extnamespace=public, pg_extension row present, to_regclass NULL).
+  (to_regclass('pg_stat_statements') IS NOT NULL
+   AND EXISTS (SELECT 1 FROM pg_settings
+                WHERE name = 'pg_stat_statements.max')) AS has_pss
 \gset
 
 WITH
@@ -442,7 +448,11 @@ stat_database AS (
     'temp_files',      temp_files,
     'temp_bytes',      temp_bytes,
     'deadlocks',       deadlocks,
+\if :is_pg12
     'checksum_failures', checksum_failures,
+\else
+    'checksum_failures', NULL,   -- pg_stat_database.checksum_failures is PG12+
+\endif
     'blk_read_time',   round(blk_read_time::numeric, 2),
     'blk_write_time',  round(blk_write_time::numeric, 2),
     'stats_reset',     stats_reset
@@ -609,7 +619,7 @@ missing_index_candidates AS (
     'table',      relname,
     'seq_scan',   seq_scan,
     'n_live_tup', n_live_tup,
-    'size_bytes', pg_total_relation_size(schemaname || '.' || quote_ident(relname))
+    'size_bytes', pg_total_relation_size(relid)
   ) ORDER BY seq_scan DESC) AS v
   FROM pg_stat_user_tables
   WHERE seq_scan > 100
